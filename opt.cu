@@ -1,0 +1,163 @@
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <math.h>
+#include <cuda_runtime.h>
+#include <cub/cub.cuh>
+//Функция, которая высчитывает разницу между двумя массивами 
+__global__ void my_sub(double* arr, double* new_arr, double* c, int n)
+{
+    unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;//Индекс для обращения к элементу массива 
+    unsigned int j = blockIdx.y * blockDim.y + threadIdx.y;//Высчитывается из логики - Номер блока на размер блока(кол-во поток) плюс номер потока
+    if((i > 0 && i < n-1) && (j > 0 && j < n-1))
+    {
+        c[i*n + j] = fabs(new_arr[i*n + j] - arr[i*n + j]);//Обращение по индексу по логике преобразования матрицы в одномерный массив
+    }
+} 
+//Функция, которая высчитывает средние значения для обновления сетки
+__global__ void update(double* arr, double* new_arr, int n)
+{
+    unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;
+    unsigned int j = blockIdx.y * blockDim.y + threadIdx.y;
+    if((i > 0 && i < n-1) && (j > 0 && j < n-1))
+    {
+        new_arr[i*n + j] = 0.25 * (arr[i*n + j - 1] + arr[i*n + j + 1] + arr[(i - 1)*n + j] + arr[(i + 1)*n + j]);
+    }
+} 
+//Функция, которая заполняет сетку начальными значениям - границами
+__global__ void fill(double* arr, double* new_arr, int n)
+{
+    unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;
+
+    arr[0] = new_arr[0] = 10;
+    arr[n - 1]= new_arr[n - 1] = 20;
+    arr[n * n - 1] = new_arr[n * n - 1] = 30;
+    arr[n * (n - 1)] = new_arr[n * (n - 1)] = 20;
+    if(i > 0 && i < n-1)
+    {
+        arr[i] = new_arr[i] = arr[0] + (10.0 / (n-1)) * i;
+        arr[n*(n-1) + i] = new_arr[n*(n-1) + i] = arr[n - 1] + 10.0 / (n-1) * i;
+        arr[n*i]= new_arr[n*i] = arr[0] + 10.0 / (n-1) * i;
+        arr[n*i + n - 1] = new_arr[n*i + n - 1] = arr[n-1] + 10.0 / (n-1) * i;
+    }
+} 
+//Функция для просмотра матрицы
+void print_matrix(double* vec, size_t n)
+{
+    for (size_t i = 0; i < n; ++i)
+    {
+        for (size_t j = 0; j < n; ++j)
+        {
+            std::cout<<vec[n*i + j]<<' ';
+        }
+        std::cout<<std::endl;
+    }
+}
+__global__ void block_reduce(const double *in1, const double *in2, const int n, double *out){
+    typedef cub::BlockReduce<double, 256> BlockReduce;
+    __shared__ typename BlockReduce::TempStorage temp_storage;
+
+    double max_diff = 0;
+
+    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n; i += gridDim.x * blockDim.x)
+    {
+    double diff = abs(in1[i] - in2[i]);
+    max_diff = fmax(diff, max_diff);
+    }
+
+    double block_max_diff = BlockReduce(temp_storage).Reduce(max_diff, cub::Max());
+
+    if (threadIdx.x == 0)
+    {
+    out[blockIdx.x] = block_max_diff;
+    }
+}
+
+int main(int argc, char *argv[]) {
+
+    auto begin = std::chrono::steady_clock::now();
+    if (argc != 7)
+    {
+        std::cout<<"Enter a string like this: Accuracy _ iterations _ size _"<<std::endl;
+    }
+
+    //Считывание значений с командной строки
+    double error = std::stod(argv[2]);//Значение ошибки
+    size_t iter = std::stoi(argv[4]);//Количество итераций
+    size_t n = std::stoi(argv[6]);//Размер сетки 
+    
+    //Объявляем необходимы перменные 
+    double* vec = new double[n*n];//Массив для значений на предыдущем шаге
+    double* new_vec = new double[n*n];//Массив для значений на текущем шаге
+    double* tmp = new double[n*n];//Вспомогаетльный массив для сохранения разницы между двумя массивами
+
+    //Указатели для device
+    double* vec_d;
+    double* new_vec_d;
+    double* tmp_d;
+
+    //Выделение памяти и копирование переменных на device
+    cudaMalloc((void **)&vec_d, sizeof(double)*n*n);
+    cudaMalloc((void **)&new_vec_d, sizeof(double)*n*n);
+    cudaMalloc((void **)&tmp_d, sizeof(double)*n*n);
+    cudaMemcpy(vec_d, vec, sizeof(double), cudaMemcpyHostToDevice);
+    cudaMemcpy(new_vec_d, new_vec, sizeof(double), cudaMemcpyHostToDevice);
+    cudaMemcpy(tmp_d, tmp, sizeof(double), cudaMemcpyHostToDevice);
+
+    double max_error = error + 1; //Объявление максимальной ошибки 
+    size_t it = 0;//Счетчик итераций
+
+    //Задаем размер блока и сетки 
+    dim3 BLOCK_SIZE = dim3(32, 32);//Размер блока - количество потоков
+    dim3 GRID_SIZE = dim3(ceil(n/32.), ceil(n/32.));//Размер сетки - количество блоков
+
+    //Заполнение угловых значений
+    fill<<<GRID_SIZE, BLOCK_SIZE>>>(vec_d, new_vec_d, n);
+ 
+    //Также инициализируем переменную для расчета максимальной ошибки на cuda
+    double* max_errorx;
+    cudaMalloc(&max_errorx, sizeof(double));
+
+    //Переменные для работы с библиотекой cub
+    void* store = NULL;//Доступное устройство выделения временного хранилища. 
+    //При NULL требуемый размер выделения записывается в bytes, и никакая работа не выполняется.
+    size_t bytes = 0;//Ссылка на размер в байтах распределения store
+    cub::DeviceReduce::Max(store, bytes, vec, max_errorx, n*n);
+    // Allocate temporary storage
+	cudaMalloc(&store, bytes);
+    int num_blocks_reduce = (n*n + 256 - 1) / 256;
+    
+    //Основной цикл алгоритма
+    while(error < max_error && it < iter)
+	{        
+        it+=1;
+        update<<<GRID_SIZE,BLOCK_SIZE>>>(vec_d, new_vec_d, n);
+        my_sub<<<GRID_SIZE, BLOCK_SIZE>>>(vec_d, new_vec_d, tmp_d, n);
+        block_reduce<<<num_blocks_reduce, 256>>>(vec_d, new_vec_d, n*n, max_errorx);
+	    cub::DeviceReduce::Max(store, bytes, tmp_d, max_errorx, num_blocks_reduce);
+        cudaMemcpy(&max_error, max_errorx, sizeof(double), cudaMemcpyDeviceToHost);//Обновление ошибки на CPU
+        double* swap = vec_d;
+        vec_d = new_vec_d;
+        new_vec_d = swap;
+
+    }
+
+    auto end = std::chrono::steady_clock::now();
+    auto elapsed_ms = std::chrono::duration_cast<std::chrono::microseconds>(end-begin);
+    cudaDeviceSynchronize();
+    cudaMemcpy(vec, vec_d, sizeof(double)*n*n, cudaMemcpyDeviceToHost);
+    cudaMemcpy(new_vec, new_vec_d, sizeof(double)*n*n, cudaMemcpyDeviceToHost);
+    print_matrix(vec, n);
+    std::cout<<"Error: "<<max_error<<std::endl;
+    std::cout<<"time: "<<elapsed_ms.count()<<" mcs\n";
+    std::cout<<"Iterations: "<<it<<std::endl;
+
+    //Очищение памяти
+    delete [] vec; 
+    delete [] new_vec;
+    delete [] tmp;
+    cudaFree(vec_d);
+    cudaFree(new_vec_d);
+    cudaFree(tmp_d);
+    return 0;  
+}
